@@ -26,6 +26,7 @@
 %% KV Backend API
 -export([
     api_version/0,
+    batch_put/4,
     callback/3,
     capabilities/1,
     capabilities/2,
@@ -166,6 +167,11 @@ put(Bucket, PrimaryKey, IndexSpecs, Val, #state{tree=Tree}=State) ->
 
     ok = hanoidb:transact(Tree, Updates1 ++ Updates2),
     {ok, State}.
+
+batch_put(_Context, Values, IndexSpecs, State) ->
+    [{ok,_} = put(Bucket, K, IndexSpecs, V, State) || {{Bucket,K},V} <- Values],
+    {ok, State}.
+
 
 %% @doc Delete an object from the hanoidb backend
 -spec delete(riak_object:bucket(), riak_object:key(), [index_spec()], state()) ->
@@ -498,24 +504,26 @@ range_scan(FoldIndexFun, Buffer, Opts, #state{tree = Tree}) ->
     EndKey1 = key_prefix(Bucket, key_to_storage_format_key(FieldOrders, EndK), LocalKeyLen),
     %% append extra byte to the key when it is not inclusive so that it compares
     %% as greater
+    StartInclusive = proplists:get_value(start_inclusive, W, true),
     StartKey2 =
-        case lists:keyfind(start_inclusive, 1, W) of
-            {start_inclusive, false}  -> <<StartKey1/binary, 16#ff:8>>;
-            _                         -> StartKey1
+        case StartInclusive of
+            false -> <<StartKey1/binary, 16#ff:8>>;
+            _     -> StartKey1
         end,
     %% append extra byte to the key when it is inclusive so that it compares
     %% as greater
+    EndInclusive = proplists:get_value(end_inclusive, W, false),
     EndKey2 =
-        case lists:keyfind(end_inclusive, 1, W) of
-            {end_inclusive, true}  -> <<EndKey1/binary, 16#ff:8>>;
-            _                      -> EndKey1
+        case EndInclusive of
+            true -> <<EndKey1/binary, 16#ff:8>>;
+            _    -> EndKey1
         end,
     FoldFun = fun build_list/3,
     Range =  #key_range{
         from_key = StartKey2,
-        from_inclusive = true,
+        from_inclusive = StartInclusive,
         to_key = EndKey2,
-        to_inclusive = true},
+        to_inclusive = EndInclusive},
     KeyFolderFn =
         fun() ->
             Vals = hanoidb:fold_range(Tree, FoldFun, [], Range),
@@ -528,23 +536,6 @@ key_to_storage_format_key(_,[]) ->
     [];
 key_to_storage_format_key([Order|OrderTail], [{_Name,_Type,Value}|KeyTail]) ->
     [riak_ql_ddl:apply_ordering(Value, Order) | key_to_storage_format_key(OrderTail, KeyTail)].
-
-%%
-range_scan_additional_options(Where) ->
-    Options1 =
-        case proplists:lookup(start_inclusive, Where) of
-             none   -> [];
-             STuple -> [STuple]
-         end,
-    Options2 =
-        case proplists:lookup(end_inclusive, Where) of
-            none   -> Options1;
-            ETuple -> [ETuple | Options1]
-        end,
-    case proplists:lookup(filter, Where) of
-        {filter, []} -> Options2;
-        {filter, Filter} -> [{range_filter, Filter} | Options2]
-    end.
 
 %%
 key_prefix({TableName,_}, PK2, LocalKeyLen) ->
