@@ -20,27 +20,28 @@
 %% ----------------------------------------------------------------------------
 
 -module(riak_kv_hanoidb_backend).
--behavior(hanoidb_temp_riak_kv_backend).
 -author('Steve Vinoski <steve@basho.com>').
 -author('Greg Burd <greg@basho.com>').
 
 %% KV Backend API
--export([api_version/0,
-         capabilities/1,
-         capabilities/2,
-         start/2,
-         stop/1,
-         get/3,
-         put/5,
-         delete/4,
-         drop/1,
-         fold_buckets/4,
-         fold_keys/4,
-         fold_objects/4,
-         is_empty/1,
-         status/1,
-         callback/3]).
-
+-export([
+    api_version/0,
+    callback/3,
+    capabilities/1,
+    capabilities/2,
+    delete/4,
+    drop/1,
+    fold_buckets/4,
+    fold_keys/4,
+    fold_objects/4,
+    get/3,
+    is_empty/1,
+    put/5,
+    range_scan/4,
+    start/2,
+    status/1,
+    stop/1
+ ]).
 
 -define(log(Fmt,Args),ok).
 
@@ -90,12 +91,7 @@ capabilities(_, _) ->
 -spec start(integer(), config()) -> {ok, state()} | {error, term()}.
 start(Partition, Config) ->
     %% Get the data root directory
-    case app_helper:get_prop_or_env(data_root, Config, hanoidb) of
-        undefined ->
-            lager:error("Failed to create hanoidb dir: data_root is not set"),
-            {error, data_root_unset};
-        DataRoot ->
-            AppStart = case application:start(hanoidb) of
+    AppStart = case application:start(hanoidb) of
                            ok ->
                                ok;
                            {error, {already_started, _}} ->
@@ -104,6 +100,11 @@ start(Partition, Config) ->
                                lager:error("Failed to init the hanoidb backend: ~p", [StartReason]),
                                {error, StartReason}
                        end,
+    case application:get_env(hanoidb, data_root) of
+        undefined ->
+            lager:error("Failed to create hanoidb dir: data_root is not set, config: ~w", [Config]),
+            {error, data_root_unset};
+        {ok, DataRoot} ->
             case AppStart of
                 ok ->
                     case get_data_dir(DataRoot, integer_to_list(Partition)) of
@@ -472,29 +473,116 @@ from_index_key(LKey) ->
             undefined
     end.
 
+
+%% ===================================================================
+%% Riak TS Queries
+%% ===================================================================
+
+range_scan(FoldIndexFun, Buffer, Opts, #state{tree = Tree}) ->
+    {_, {BucketType,_} = Bucket, QueryProps} = proplists:lookup(index, Opts),
+    W = proplists:get_value(where, QueryProps),
+    LKAST = proplists:get_value(local_key_ast, QueryProps),
+    %% always rebuild the module name, do not use the name from the select
+    %% record because it was built in a different node which may have a
+    %% different module name because of compile versions in mixed version
+    %% clusters
+    Mod = riak_ql_ddl:make_module_name(BucketType),
+    {startkey, StartK} = proplists:lookup(startkey, W),
+    {endkey,   EndK}   = proplists:lookup(endkey, W),
+    FieldOrders = Mod:field_orders(),
+    LocalKeyLen = length(LKAST),
+    %% in the case where a local key is descending (it has the DESC keyword)
+    %% then the start and end keys will have been swapped, the start key will
+    %% be "greater" than the end key until ordering is applied.
+    StartKey1 = key_prefix(Bucket,  key_to_storage_format_key(FieldOrders, StartK), LocalKeyLen),
+    EndKey1 = key_prefix(Bucket, key_to_storage_format_key(FieldOrders, EndK), LocalKeyLen),
+    %% append extra byte to the key when it is not inclusive so that it compares
+    %% as greater
+    StartKey2 =
+        case lists:keyfind(start_inclusive, 1, W) of
+            {start_inclusive, false}  -> <<StartKey1/binary, 16#ff:8>>;
+            _                         -> StartKey1
+        end,
+    %% append extra byte to the key when it is inclusive so that it compares
+    %% as greater
+    EndKey2 =
+        case lists:keyfind(end_inclusive, 1, W) of
+            {end_inclusive, true}  -> <<EndKey1/binary, 16#ff:8>>;
+            _                      -> EndKey1
+        end,
+    FoldFun = fun build_list/3,
+    Range =  #key_range{
+        from_key = StartKey2,
+        from_inclusive = true,
+        to_key = EndKey2,
+        to_inclusive = true},
+    KeyFolderFn =
+        fun() ->
+            Vals = hanoidb:fold_range(Tree, FoldFun, [], Range),
+            FoldIndexFun(lists:reverse(Vals), Buffer)
+        end,
+    {async, KeyFolderFn}.
+
+%% Apply ordering to the key values.
+key_to_storage_format_key(_,[]) ->
+    [];
+key_to_storage_format_key([Order|OrderTail], [{_Name,_Type,Value}|KeyTail]) ->
+    [riak_ql_ddl:apply_ordering(Value, Order) | key_to_storage_format_key(OrderTail, KeyTail)].
+
+%%
+range_scan_additional_options(Where) ->
+    Options1 =
+        case proplists:lookup(start_inclusive, Where) of
+             none   -> [];
+             STuple -> [STuple]
+         end,
+    Options2 =
+        case proplists:lookup(end_inclusive, Where) of
+            none   -> Options1;
+            ETuple -> [ETuple | Options1]
+        end,
+    case proplists:lookup(filter, Where) of
+        {filter, []} -> Options2;
+        {filter, Filter} -> [{range_filter, Filter} | Options2]
+    end.
+
+%%
+key_prefix({TableName,_}, PK2, LocalKeyLen) ->
+    PK3 = PK2 ++ lists:duplicate(LocalKeyLen - length(PK2), '_'),
+    PKPrefix = sext:prefix(list_to_tuple(PK3)),
+    EncodedBucketType = EncodedBucketName = sext:encode(TableName),
+    <<16,0,0,0,3, %% 3-tuple - outer
+      12,183,128,8, %% o-atom
+      16,0,0,0,2, %% 2-tuple for bucket type/name
+      EncodedBucketType/binary,
+      EncodedBucketName/binary,
+      PKPrefix/binary>>.
+
+build_list(K, V, Acc) ->
+    [{K,V} | Acc].
+
 %% ===================================================================
 %% EUnit tests
 %% ===================================================================
 -ifdef(TEST).
 
--include("src/hanoidb.hrl").
 
 key_range_test() ->
     Range = to_key_range({bucket, <<"a">>}),
 
-    ?assertEqual(true,  ?KEY_IN_RANGE( to_object_key(<<"a">>, <<>>) , Range)),
-    ?assertEqual(true,  ?KEY_IN_RANGE( to_object_key(<<"a">>, <<16#ff,16#ff,16#ff,16#ff>>), Range )),
-    ?assertEqual(false, ?KEY_IN_RANGE( to_object_key(<<>>, <<>>), Range )),
-    ?assertEqual(false, ?KEY_IN_RANGE( to_object_key(<<"a",0>>, <<>>), Range )).
+    ?assertEqual(true,  hanoidb_util:is_key_in_range( to_object_key(<<"a">>, <<>>) , Range)),
+    ?assertEqual(true,  hanoidb_util:is_key_in_range( to_object_key(<<"a">>, <<16#ff,16#ff,16#ff,16#ff>>), Range )),
+    ?assertEqual(false, hanoidb_util:is_key_in_range( to_object_key(<<>>, <<>>), Range )),
+    ?assertEqual(false, hanoidb_util:is_key_in_range( to_object_key(<<"a",0>>, <<>>), Range )).
 
 index_range_test() ->
     Range = to_key_range({index, <<"idx">>, {range, <<"f">>, <<6>>, <<7,3>>}}),
 
-    ?assertEqual(false, ?KEY_IN_RANGE( to_index_key(<<"idx">>, <<"key1">>, <<"f">>, <<5>>) , Range)),
-    ?assertEqual(true,  ?KEY_IN_RANGE( to_index_key(<<"idx">>, <<"key1">>, <<"f">>, <<6>>) , Range)),
-    ?assertEqual(true,  ?KEY_IN_RANGE( to_index_key(<<"idx">>, <<"key1">>, <<"f">>, <<7>>) , Range)),
-    ?assertEqual(false, ?KEY_IN_RANGE( to_index_key(<<"idx">>, <<"key1">>, <<"f">>, <<7,4>>) , Range)),
-    ?assertEqual(false, ?KEY_IN_RANGE( to_index_key(<<"idx">>, <<"key1">>, <<"f">>, <<9>>) , Range)).
+    ?assertEqual(false, hanoidb_util:is_key_in_range( to_index_key(<<"idx">>, <<"key1">>, <<"f">>, <<5>>) , Range)),
+    ?assertEqual(true,  hanoidb_util:is_key_in_range( to_index_key(<<"idx">>, <<"key1">>, <<"f">>, <<6>>) , Range)),
+    ?assertEqual(true,  hanoidb_util:is_key_in_range( to_index_key(<<"idx">>, <<"key1">>, <<"f">>, <<7>>) , Range)),
+    ?assertEqual(false, hanoidb_util:is_key_in_range( to_index_key(<<"idx">>, <<"key1">>, <<"f">>, <<7,4>>) , Range)),
+    ?assertEqual(false, hanoidb_util:is_key_in_range( to_index_key(<<"idx">>, <<"key1">>, <<"f">>, <<9>>) , Range)).
 
 
 simple_test_() ->
