@@ -169,6 +169,7 @@ put(Bucket, PrimaryKey, IndexSpecs, Val, #state{tree=Tree}=State) ->
     {ok, State}.
 
 batch_put(_Context, Values, IndexSpecs, State) ->
+    %% TODO improve this beyond individual puts
     [{ok,_} = put(Bucket, K, IndexSpecs, V, State) || {{Bucket,K},V} <- Values],
     {ok, State}.
 
@@ -488,6 +489,7 @@ range_scan(FoldIndexFun, Buffer, Opts, #state{tree = Tree}) ->
     {_, {BucketType,_} = Bucket, QueryProps} = proplists:lookup(index, Opts),
     W = proplists:get_value(where, QueryProps),
     LKAST = proplists:get_value(local_key_ast, QueryProps),
+    FilterPredicateFn = proplists:get_value(filter_predicate_fn, QueryProps),
     %% always rebuild the module name, do not use the name from the select
     %% record because it was built in a different node which may have a
     %% different module name because of compile versions in mixed version
@@ -518,7 +520,17 @@ range_scan(FoldIndexFun, Buffer, Opts, #state{tree = Tree}) ->
             true -> <<EndKey1/binary, 16#ff:8>>;
             _    -> EndKey1
         end,
-    FoldFun = fun build_list/3,
+    FoldFun =
+        fun(K, V, Acc) ->
+            %% TODO the filter fun decodes the value, so we could use this
+            %%      decoded row instead of decoding it again elsewhere
+            case FilterPredicateFn(V) of
+                true ->
+                    [{K,V}|Acc];
+                false ->
+                    Acc
+            end
+        end,
     Range =  #key_range{
         from_key = StartKey2,
         from_inclusive = StartInclusive,
