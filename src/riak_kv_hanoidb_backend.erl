@@ -92,15 +92,18 @@ capabilities(_, _) ->
 -spec start(integer(), config()) -> {ok, state()} | {error, term()}.
 start(Partition, Config) ->
     %% Get the data root directory
-    AppStart = case application:start(hanoidb) of
-                           ok ->
-                               ok;
-                           {error, {already_started, _}} ->
-                               ok;
-                           {error, StartReason} ->
-                               lager:error("Failed to init the hanoidb backend: ~p", [StartReason]),
-                               {error, StartReason}
-                       end,
+    AppStart =
+        case application:ensure_all_started(hanoidb) of
+            {ok,_} ->
+                ok;
+            ok ->
+                ok;
+            {error, {already_started, _}} ->
+                ok;
+            {error, StartReason} ->
+                lager:error("Failed to init the hanoidb backend: ~p", [StartReason]),
+                {error, StartReason}
+        end,
     case application:get_env(hanoidb, data_root) of
         undefined ->
             lager:error("Failed to create hanoidb dir: data_root is not set, config: ~w", [Config]),
