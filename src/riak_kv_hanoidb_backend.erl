@@ -491,6 +491,10 @@ from_index_key(LKey) ->
 range_scan(FoldIndexFun, Buffer, Opts, #state{tree = Tree}) ->
     {_, {BucketType,_} = Bucket, QueryProps} = proplists:lookup(index, Opts),
     W = proplists:get_value(where, QueryProps),
+    Offset = proplists:get_value(offset, QueryProps),
+    Limit = proplists:get_value(limit, QueryProps),
+    GroupBy = proplists:get_value(group_by, QueryProps),
+    OrderBy = proplists:get_value(order_by, QueryProps),
     LKAST = proplists:get_value(local_key_ast, QueryProps),
     FilterPredicateFn = proplists:get_value(filter_predicate_fn, QueryProps),
     %% always rebuild the module name, do not use the name from the select
@@ -538,7 +542,8 @@ range_scan(FoldIndexFun, Buffer, Opts, #state{tree = Tree}) ->
         from_key = StartKey2,
         from_inclusive = StartInclusive,
         to_key = EndKey2,
-        to_inclusive = EndInclusive},
+        to_inclusive = EndInclusive,
+        limit = find_query_limit(Offset, Limit, GroupBy, OrderBy)},
     KeyFolderFn =
         fun() ->
             Vals = hanoidb:fold_range(Tree, FoldFun, [], Range),
@@ -564,8 +569,16 @@ key_prefix({TableName,_}, PK2, LocalKeyLen) ->
       EncodedBucketName/binary,
       PKPrefix/binary>>.
 
-build_list(K, V, Acc) ->
-    [{K,V} | Acc].
+find_query_limit(Offset, Limit, GroupBy, OrderBy) when GroupBy /= [] orelse
+                                                       OrderBy /= [] orelse
+                                                       (Offset == [] andalso Limit == []) ->
+    undefined;
+find_query_limit(Offset, Limit, _, _) ->
+    limit_number(Offset) + limit_number(Limit).
+
+limit_number([ ]) -> 0;
+limit_number([V]) -> V.
+
 
 %% ===================================================================
 %% EUnit tests
