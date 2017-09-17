@@ -38,6 +38,7 @@
     get/3,
     is_empty/1,
     put/5,
+    put/6,
     range_scan/4,
     start/2,
     status/1,
@@ -155,25 +156,42 @@ get(Bucket, Key, #state{tree=Tree}=State) ->
 -spec put(riak_object:bucket(), riak_object:key(), [index_spec()], binary(), state()) ->
                  {ok, state()} |
                  {error, term(), state()}.
-put(Bucket, PrimaryKey, IndexSpecs, Val, #state{tree=Tree}=State) ->
+put(Bucket, PrimaryKey, IndexSpecs, Val, State) ->
+    Expiry = infinity,
+    put(Bucket, PrimaryKey, IndexSpecs, Val, Expiry, State).
+
+-spec put(riak_object:bucket(), riak_object:key(), [index_spec()], binary(), infinity|pos_integer(), state()) ->
+                 {ok, state()} |
+                 {error, term(), state()}.
+put(Bucket, PrimaryKey, IndexSpecs, Val, Expiry, #state{tree=Tree}=State) ->
     %% Create the KV update...
     StorageKey = to_object_key(Bucket, PrimaryKey),
-    Updates1 = [{put, StorageKey, Val}],
+    ValWrite = {put, StorageKey, Val, Expiry},
+    Updates =
+        case IndexSpecs of
+            [] ->
+                [ValWrite];
+            _ ->
+                [ValWrite|index_specs_to_transaction_updates(Bucket, PrimaryKey, IndexSpecs)]
+        end,
+    ok = hanoidb:transact(Tree, Updates),
+    {ok, State}.
 
+%%
+index_specs_to_transaction_updates(Bucket, PrimaryKey, IndexSpecs) ->
+    %% FIXME expiry for indexes?
     %% Convert IndexSpecs to index updates...
     F = fun({add, Field, Value}) ->
                 {put, to_index_key(Bucket, PrimaryKey, Field, Value), <<>>};
            ({remove, Field, Value}) ->
                 {delete, to_index_key(Bucket, PrimaryKey, Field, Value)}
         end,
-    Updates2 = [F(X) || X <- IndexSpecs],
+    [F(X) || X <- IndexSpecs].
 
-    ok = hanoidb:transact(Tree, Updates1 ++ Updates2),
-    {ok, State}.
-
-batch_put(_Context, Values, IndexSpecs, State) ->
+batch_put(Context, Values, IndexSpecs, State) ->
+    Expiry = proplists:get_value(expiry_secs, Context),
     %% TODO improve this beyond individual puts
-    [{ok,_} = put(Bucket, K, IndexSpecs, V, State) || {{Bucket,K},V} <- Values],
+    [{ok,_} = put(Bucket, K, IndexSpecs, V, Expiry, State) || {{Bucket,K},V} <- Values],
     {ok, State}.
 
 
